@@ -1,5 +1,3 @@
-# H-BAV/environment.py
-
 import pygame
 import numpy as np
 import random
@@ -14,7 +12,7 @@ COLOR_TEXT = (220, 220, 220)
 
 
 class HBAVEnv:
-    def __init__(self, width=800, height=600, version=1):
+    def __init__(self, width=800, height=600):
         pygame.init()
         self.width = width
         self.height = height
@@ -27,21 +25,25 @@ class HBAVEnv:
         self.play_area_rect = pygame.Rect(self.margin, self.margin, self.width - 2 * self.margin,
                                           self.height - 2 * self.margin)
 
-        self.version = version
         self.clock = pygame.time.Clock()
+
+        self.max_balls_in_state = 6
 
         self.agent_size = 30
         self.agent_speed = 7
         self.ball_radius = 20
         self.ball_speed = 15
 
-        self.reward_survive = 1
-        self.reward_terminate = -100
-        self.reward_wall_hit = -2
+        self.reward_survive_base = 0.1
+        self.reward_terminate_base = -10
+        self.reward_wall_hit = -0.5
 
         self.reset()
 
     def _add_ball(self):
+        if len(self.balls) >= 6:
+            return
+
         while True:
             pos = [
                 random.randint(self.play_area_rect.left + self.ball_radius,
@@ -49,12 +51,24 @@ class HBAVEnv:
                 random.randint(self.play_area_rect.top + self.ball_radius,
                                self.play_area_rect.bottom - self.ball_radius)
             ]
-            if np.linalg.norm(np.array(pos) - np.array(self.agent_pos.center)) > 50:
+            if np.linalg.norm(np.array(pos) - np.array(self.agent_pos.center)) > 75:
                 break
 
-        angle = random.uniform(0, 2 * math.pi)
-        vel = [math.cos(angle) * self.ball_speed, math.sin(angle) * self.ball_speed]
+        degree_margin = 10  # 10 Grad Mindestabstand zu den Achsen
+        margin_rad = math.radians(degree_margin)
 
+        valid_intervals = [
+            (margin_rad, math.pi / 2 - margin_rad),
+            (math.pi / 2 + margin_rad, math.pi - margin_rad),
+            (math.pi + margin_rad, 3 * math.pi / 2 - margin_rad),
+            (3 * math.pi / 2 + margin_rad, 2 * math.pi - margin_rad)
+        ]
+
+        chosen_interval = random.choice(valid_intervals)
+
+        angle = random.uniform(chosen_interval[0], chosen_interval[1])
+
+        vel = [math.cos(angle) * self.ball_speed, math.sin(angle) * self.ball_speed]
         self.balls.append({'pos': pos, 'vel': vel})
 
     def reset(self):
@@ -71,92 +85,84 @@ class HBAVEnv:
         return self._get_state()
 
     def _get_state(self):
-        closest_ball = None
-        min_dist = float('inf')
-        for ball in self.balls:
-            dist = np.linalg.norm(np.array(self.agent_pos.center) - np.array(ball['pos']))
-            if dist < min_dist:
-                min_dist = dist
-                closest_ball = ball
-
-        dist_to_wall_left = self.agent_pos.left - self.play_area_rect.left
-        dist_to_wall_right = self.play_area_rect.right - self.agent_pos.right
-        dist_to_wall_top = self.agent_pos.top - self.play_area_rect.top
-        dist_to_wall_bottom = self.play_area_rect.bottom - self.agent_pos.bottom
-
-        agent_x = dist_to_wall_left / self.play_area_rect.width
-        agent_y = dist_to_wall_top / self.play_area_rect.height
-
-        ball_x = (closest_ball['pos'][0] - self.play_area_rect.left) / self.play_area_rect.width
-        ball_y = (closest_ball['pos'][1] - self.play_area_rect.top) / self.play_area_rect.height
-
         wall_dists = [
-            dist_to_wall_left / self.play_area_rect.width,
-            dist_to_wall_right / self.play_area_rect.width,
-            dist_to_wall_top / self.play_area_rect.height,
-            dist_to_wall_bottom / self.play_area_rect.height
+            (self.agent_pos.left - self.play_area_rect.left) / self.play_area_rect.width,
+            (self.play_area_rect.right - self.agent_pos.right) / self.play_area_rect.width,
+            (self.agent_pos.top - self.play_area_rect.top) / self.play_area_rect.height,
+            (self.play_area_rect.bottom - self.agent_pos.bottom) / self.play_area_rect.height
         ]
 
-        if self.version == 1:
-            state = [agent_x, agent_y, ball_x, ball_y] + wall_dists
-        else:
-            max_dist = np.linalg.norm([self.play_area_rect.width, self.play_area_rect.height])
-            state = [agent_x, agent_y, min_dist / max_dist] + wall_dists
+        self.balls.sort(key=lambda b: np.linalg.norm(np.array(self.agent_pos.center) - np.array(b['pos'])))
 
+        ball_states = []
+        for i in range(self.max_balls_in_state):
+            if i < len(self.balls):
+                ball = self.balls[i]
+                rel_x = (ball['pos'][0] - self.agent_pos.centerx) / self.play_area_rect.width
+                rel_y = (ball['pos'][1] - self.agent_pos.centery) / self.play_area_rect.height
+                ball_states.extend([rel_x, rel_y])
+            else:
+                ball_states.extend([0, 0])
+
+        state = wall_dists + ball_states
         return np.array(state, dtype=np.float32)
 
     def step(self, action):
         old_pos = self.agent_pos.topleft
-
-        is_move_action = action <= 3
         reward = 0
-        if is_move_action:
-            if action == 0: self.agent_pos.y -= self.agent_speed
-            elif action == 1: self.agent_pos.y += self.agent_speed
-            elif action == 2: self.agent_pos.x -= self.agent_speed
-            elif action == 3: self.agent_pos.x += self.agent_speed
+        done = False
+
+        if action <= 3:
+            if action == 0:
+                self.agent_pos.y -= self.agent_speed
+            elif action == 1:
+                self.agent_pos.y += self.agent_speed
+            elif action == 2:
+                self.agent_pos.x -= self.agent_speed
+            elif action == 3:
+                self.agent_pos.x += self.agent_speed
         elif action == 4:
             self._add_ball()
-            reward += 10
+            reward = 0.1
         elif action == 5:
             if len(self.balls) > 1:
-                reward -= 15
                 self.balls.pop()
+                reward = -0.1
 
         self.agent_pos.left = max(self.play_area_rect.left, self.agent_pos.left)
         self.agent_pos.right = min(self.play_area_rect.right, self.agent_pos.right)
         self.agent_pos.top = max(self.play_area_rect.top, self.agent_pos.top)
         self.agent_pos.bottom = min(self.play_area_rect.bottom, self.agent_pos.bottom)
 
+        self.steps_survived += 1
 
-        done = False
-
-        has_moved = self.agent_pos.topleft != old_pos
-
-        if is_move_action:
+        if action <= 3:
+            has_moved = self.agent_pos.topleft != old_pos
             if has_moved:
-                self.steps_survived += len(self.balls)
-                reward = self.reward_survive * len(self.balls)
+                # Belohnung skaliert mit Anzahl der Bälle
+                reward = self.reward_survive_base * len(self.balls)
             else:
                 reward = self.reward_wall_hit
-                # NEU: Die Punktzahl wird um den negativen Wert der Strafe reduziert.
-                self.steps_survived += self.reward_wall_hit
 
         # Ballbewegung
         for ball in self.balls:
             ball['pos'][0] += ball['vel'][0]
             ball['pos'][1] += ball['vel'][1]
-            if ball['pos'][0] <= self.play_area_rect.left + self.ball_radius or ball['pos'][0] >= self.play_area_rect.right - self.ball_radius:
+            if ball['pos'][0] <= self.play_area_rect.left + self.ball_radius or ball['pos'][
+                0] >= self.play_area_rect.right - self.ball_radius:
                 ball['vel'][0] *= -1
-            if ball['pos'][1] <= self.play_area_rect.top + self.ball_radius or ball['pos'][1] >= self.play_area_rect.bottom - self.ball_radius:
+            if ball['pos'][1] <= self.play_area_rect.top + self.ball_radius or ball['pos'][
+                1] >= self.play_area_rect.bottom - self.ball_radius:
                 ball['vel'][1] *= -1
 
         # Kollisionsprüfung
         for ball in self.balls:
-            ball_rect = pygame.Rect(ball['pos'][0] - self.ball_radius, ball['pos'][1] - self.ball_radius, self.ball_radius * 2, self.ball_radius * 2)
+            ball_rect = pygame.Rect(ball['pos'][0] - self.ball_radius, ball['pos'][1] - self.ball_radius,
+                                    self.ball_radius * 2, self.ball_radius * 2)
             if self.agent_pos.colliderect(ball_rect):
                 done = True
-                reward = self.reward_terminate * len(self.balls)
+                # Strafe skaliert mit Anzahl der Bälle
+                reward = self.reward_terminate_base * len(self.balls)
                 break
 
         next_state = self._get_state()
